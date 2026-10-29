@@ -97,6 +97,39 @@ launcher Python (legado, não usar) e qualquer otimização de desempenho.
   Nunca use `checkout -f` nem `clean` no submódulo.
 - Nunca use `git stash` sem nome: a pilha de stash é compartilhada entre worktrees.
 
+### Onde o agente roda
+
+O roadmap vale nos dois ambientes abaixo. Descubra em qual você está antes da F0 (`uname -s`,
+`$OS`, o caminho do repo) e siga as regras do modo certo.
+
+| | **Modo nuvem** (Claude Code na web, container Linux) | **Modo local** (Claude Code no PC Windows do mantenedor) |
+|:--|:--|:--|
+| Repositório | clone em `/home/user/...` | `C:\Projetos\Projects\GOW3PC`, com worktrees ao lado |
+| Executável do jogo | **não tem** | existe no dump do mantenedor: pergunte o caminho na F0 |
+| Build do jogo | Linux (`build.sh`), só para compilar e testar | Windows, MSYS2 CLANG64 (`build.sh`), como o CI |
+| Testes só do Windows | não rodam (`test_qte_hook`, snapshots do launcher) | rodam |
+| `test_signatures` com o executável | não roda | roda, com o `eboot.elf` preparado |
+| Push e PR | em geral recusado (403): entrega por bundle (§3.5) | direto, **com autorização** do mantenedor |
+| Build Windows para teste | workflow Windows zip, disparado pelo mantenedor | workflow Windows zip, ou o pacote local (`packaging/windows/package.sh`) |
+| Ler o `last_run.log` | o mantenedor envia o arquivo | ler direto da pasta do port (`<port>\user\last_run.log`), depois que o mantenedor jogar |
+| Jogar | **nunca** | **nunca**: o teste no jogo é sempre do mantenedor |
+
+**Regras do modo local:**
+- **O executável do jogo fica onde está.** Leia direto do dump, sem copiar para dentro do repo nem
+  para worktrees, e sem anexar a issues ou PRs. Saídas de análise (endereços e trechos curtos de
+  disassembly) podem ir para documentos da pesquisa; o arquivo inteiro, nunca.
+- **Não mexa na instalação do jogo do mantenedor.** Builds de teste vão para uma pasta separada (por
+  exemplo `C:\Projetos\Projects\GOW3PC-test\<fase>`). Faça backup de `user\` (saves e configurações)
+  antes de qualquer teste que possa escrever nela.
+- **Não abra o jogo.** Prepare a build e o roteiro e avise o mantenedor. Ele joga, e depois você lê
+  o log.
+- **A carga é do PC do mantenedor:** no máximo 2 builds pesados ao mesmo tempo, e pergunte antes de
+  rodar o empacotamento completo.
+- **Não toque nas worktrees de outros trabalhos** (por exemplo as do Codex). Crie as suas com nomes
+  da fase.
+- **Comandos:** use Git Bash ou o shell do MSYS2 para `build.sh`, e PowerShell ou Git Bash para
+  `cargo` e `gh`.
+
 ---
 
 ## 3. Como o motor e o "Alto FPS" funcionam hoje
@@ -162,9 +195,13 @@ Leia isto antes de qualquer fase. Os caminhos são da `main` em `f593377`.
   só mudanças, porque muitas funções rodam a cada quadro.
 - **O executável de referência** é o `eboot.bin` do CUSA01623 v01.02 (sha256
   `d85c8135d330c3b601bf5dc3f1dd86bd6119fb8a9fce372bed2c9785f9a79299`). O
-  `tests/test_signatures.cpp` recebe o `eboot.elf` preparado como argumento. **O agente só tem
-  acesso a ele se o mantenedor fornecer o arquivo do próprio dump.** Sem ele, a F4 fica limitada a
-  hipóteses e builds de registro que o mantenedor roda.
+  `tests/test_signatures.cpp` recebe o `eboot.elf` preparado como argumento.
+- **Decisão do mantenedor (2026-10-29): o executável não sai do PC dele.** A pesquisa segue assim:
+  - **Modo nuvem:** o agente escreve a ferramenta de análise (F4.0). O mantenedor a roda no próprio
+    dump e cola a saída na conversa. Depois, cada hipótese é confirmada por um build de registro que
+    ele joga.
+  - **Modo local:** o agente roda a mesma ferramenta direto no dump do mantenedor, sem copiar o
+    arquivo (§2, "Onde o agente roda"), e lê o `last_run.log` depois das sessões dele.
 - **Ferramentas úteis no Linux:** `objdump -D -b binary -mi386:x86-64 --start-address=…`, ou
   `rizin`/`radare2` se instaláveis, e um script Python que procura referências RIP-relative a um
   endereço (`lea`/`mov` com `[rip+disp32]`).
@@ -191,6 +228,13 @@ Leia isto antes de qualquer fase. Os caminhos são da `main` em `f593377`.
      `git fetch` do bundle, `git push`, `gh workflow run windows-zip.yml --ref <branch>`,
      `gh run watch` e `gh run download`.
   3. O repositório local do mantenedor fica em `C:\Projetos\Projects\GOW3PC`.
+- **Modo local:**
+  - faça o push da branch da fase (com autorização) e dispare o Windows zip com
+    `gh workflow run windows-zip.yml -R FelipePrado0/SpartanPort --ref <branch>`;
+  - ou, para iterar mais rápido em builds de registro, compile no MSYS2 CLANG64 (`bash build.sh`) e
+    monte o pacote numa pasta de teste separada.
+
+  Em qualquer caso, rode os testes só do Windows antes de entregar.
 - **Ambiente de teste do mantenedor:** Windows, RX 6700 XT, monitor de 240 Hz, CUSA01623 v01.02,
   controle de PS4 e headset Logitech G733.
 
@@ -208,12 +252,20 @@ Leia isto antes de qualquer fase. Os caminhos são da `main` em `f593377`.
 - [ ] Ler `src/qte_hook.h`, `src/graphics_hook.h`, `src/runtime_pad.c` (seções QTE e
       `engine_fps_combo`), `gpu/shim/spartanport_settings.cpp` (`SyncEngineFps`, `EngineFpsNow`,
       `CycleEngineFps`) e `docs/moves.md`.
-- [ ] Perguntar ao mantenedor se ele fornece o `eboot.elf`/`eboot.bin` do dump (CUSA01623 v01.02)
-      para a F4. Registrar a resposta aqui. **Nunca fazer commit desse arquivo.**
-- [ ] Pedir ao mantenedor um `last_run.log` de uma sessão normal a 240 FPS, como referência.
+- [ ] Identificar o modo (nuvem ou local) e registrar aqui.
+- [ ] **Modo local:**
+  - perguntar ao mantenedor o caminho do dump do jogo (a pasta com o `eboot.bin`) e o da instalação
+    do port usada nos testes (a do log de referência era `E:\Games\ps4\Jogos\spartanport-windows`);
+  - registrar os dois aqui;
+  - conferir o sha256 do `eboot.bin` (§3.4);
+  - **nunca fazer commit nem copiar esse arquivo.**
+- [ ] **Modo nuvem:** registrar que a análise do executável será feita pelo mantenedor com a
+      ferramenta da F4.0.
+- [ ] Pedir ao mantenedor um `last_run.log` de uma sessão normal a 240 FPS, como referência. No modo
+      local, ler direto da pasta do port.
 
-**Pronto quando:** os testes passam (ou as falhas pré-existentes estão anotadas), e a resposta sobre
-o executável está registrada.
+**Pronto quando:** os testes passam (ou as falhas pré-existentes estão anotadas), e o modo e os
+caminhos estão registrados.
 
 ### F1. Catálogo e triagem dos bugs de FPS alto
 
@@ -402,8 +454,38 @@ e foram validadas.
 corrigi-la, para que funcione igual a 60 em qualquer taxa. Ao final, a área ou o tipo de prompt sai
 da rede de segurança.
 
-**Pré-requisito:** o executável do dump fornecido pelo mantenedor (§3.4). Sem ele, só é possível
-preparar builds de registro para o mantenedor rodar.
+**Pré-requisito:** a ferramenta da F4.0 e acesso à saída dela: colada pelo mantenedor no modo
+nuvem, ou rodada direto no dump no modo local (§3.4).
+
+#### F4.0 Ferramenta de análise (fazer uma vez, antes da primeira mecânica)
+
+**Objetivo:** listar, no executável do jogo, **todo código que lê a taxa do motor**, sem que o arquivo
+saia do PC do mantenedor.
+
+- **Arquivo:** `tools/find_rate_readers.py`. É Python 3 puro, sem dependências, e roda com
+  `python -I`. Ele usa o `llvm-objdump`/`objdump` só se estiver no PATH.
+- **Entrada:** o caminho do `eboot.elf` (o preparado pelo port) ou do `eboot.bin`.
+- **O que faz:**
+  1. Acha o setter da taxa com a mesma assinatura de `engine_fps_setter` (`src/probe.c`) e calcula os
+     endereços dos dois globais da taxa (o float e o inteiro arredondado). Implemente a busca de
+     assinatura com `??` como coringa, igual a `src/signature.h`.
+  2. Acha a constante 59,94 (`0x426fc28f`), a 60,0 (`0x42700000`) e a 1/60 (`0x3c888889`) nos dados.
+  3. Percorre o código procurando instruções com `[rip+disp32]` que apontam para esses endereços. No
+     mínimo: `lea`, `mov`, `movss`/`vmovss`, `cvtsi2ss` e as formas VEX de `mulss`/`divss`/`addss`.
+     Na dúvida, aceite qualquer instrução cujo disp32 resolva para o alvo, e marque como "a
+     confirmar".
+  4. Para cada leitor, imprime o offset no executável e o endereço virtual, qual alvo ele lê, 48
+     bytes em hex ao redor e, se houver `objdump`, a disassembly de ±16 instruções. Agrupa os
+     leitores por função (do `push rbp` anterior até o `ret` seguinte) e diz quantos leitores cada
+     função tem.
+  5. Confere os casos conhecidos: o leitor da "swing energy" em `0x48ff1a` (v01.02) **precisa
+     aparecer**. Se não aparecer, a ferramenta está errada.
+- **Saída:** texto, para colar na conversa (modo nuvem) ou salvar em
+  `docs/high-fps/readers-<data>.txt` (modo local). Só endereços e trechos curtos, nunca o arquivo.
+- **Teste:** `tests/test_find_rate_readers.py`, com um "executável" sintético montado no teste (um
+  setter falso com a assinatura, um global e três leitores) e a contagem esperada de leitores. Não
+  usa arquivos do jogo.
+- **Spec curta** antes de implementar, como sempre.
 
 #### F4.1 Método (repetir por mecânica)
 
@@ -412,11 +494,20 @@ preparar builds de registro para o mantenedor rodar.
    - gravidade integrada com passo fixo;
    - contador de quadros usado como timer;
    - colisão testada só no fim do passo.
-2. **Achar quem lê a taxa:** procure no executável as referências aos dois globais da taxa (os que
-   `find_engine_fps` acha) e à constante 59,94. Cada leitor é um candidato. O caso da "swing energy"
-   (`0x48ff1a` → 60,0) é exatamente um leitor que não devia escalar com a taxa.
+2. **Achar quem lê a taxa:** use a saída da F4.0. Cada leitor é um candidato. O caso da "swing
+   energy" (`0x48ff1a` → 60,0) é exatamente um leitor que não devia escalar com a taxa.
+   - Priorize as funções com leitores que ficam perto do sintoma: uma função de pulo, de gravidade,
+     de colisão, de áudio.
+   - Se nenhum leitor explicar o sintoma, a rotina provavelmente conta quadros sem ler a taxa. Nesse
+     caso, um build de registro mais largo (passo 3) mostra quais valores mudam entre 60 e 240.
 3. **Build de registro** no trecho do catálogo: registre os valores do candidato, como velocidade
    vertical, altura máxima ou contadores, a 60 e a 240, na mesma ação. A diferença confirma a causa.
+   - **Modo nuvem:** entregue a build por bundle e Windows zip (§3.5), mais um roteiro de 3 a 5
+     linhas: onde ir, o que fazer a 60 e a 240 com R3 + L1 + R1, e quais linhas do log enviar.
+   - **Modo local:** compile e monte a build na pasta de teste. Peça ao mantenedor que jogue o
+     roteiro e leia o `last_run.log` direto.
+   - Em ambos: uma hipótese por rodada, registrando só mudanças, com um prefixo fácil de filtrar no
+     log (por exemplo `HighFPS: jump ...`). Retire o build de registro antes da PR de correção.
 4. **Correção, uma de três formas, em ordem de preferência:**
    - **(a)** apontar a leitura para a constante 60,0, como na "swing energy": uma linha no
      `patches/CUSA01623.xml`, com `Pattern`/`At`;
@@ -468,7 +559,7 @@ mantido na rede de segurança com o motivo no catálogo.
 | F1 | — | `docs/high-fps/catalog.md` | issue de acompanhamento |
 | F2 | teto do motor, `qte_active`, opção `auto_safe_fps` | este arquivo e o README (opção) | PR da fase |
 | F3 | sinal de área, lista de áreas | este arquivo e o catálogo | PR da fase |
-| F4 | patches e stubs por mecânica | o catálogo e `docs/moves.md`, se houver pesquisa nova | uma PR por mecânica |
+| F4 | `tools/find_rate_readers.py` (F4.0), patches e stubs por mecânica | o catálogo e `docs/moves.md`, se houver pesquisa nova | uma PR por mecânica |
 | F5 | — | README e notas de release | issues fechadas |
 
 ## 6. Formato de cada entrega ao mantenedor
@@ -493,7 +584,7 @@ Ao fim de cada fase, nesta ordem:
 | Tranco ao trocar de taxa no meio do jogo | engasgo de 1 quadro, som estalando | registrar e medir na F2; se incomodar, suavizar ou trocar só na borda do QTE |
 | Um tipo de QTE não move o `heartbeat` | a queda não acontece nele | F2.2: confirmar todos os tipos e adicionar heartbeat aos stubs que faltarem |
 | Sinal de área grosso demais | uma fase inteira a 60 | F3.1: escolher sinal mais fino; priorizar a correção daquela mecânica na F4 |
-| Sem acesso ao executável | F4 parada | builds de registro rodados pelo mantenedor; a F2 e a F3 continuam valendo |
+| Executável só no PC do mantenedor | rodadas a mais na F4 no modo nuvem | ferramenta da F4.0 rodada por ele e builds de registro focados; no modo local, análise direta no dump |
 | Correção de causa muda a dificuldade | o jogo fica diferente de 60 | validar contra 60 no mesmo trecho; a referência é sempre 60 |
 | Bug do jogo original confundido com bug de FPS | trabalho perdido | F1: confirmar a 60 antes de qualquer código |
 | Imagens de referência do launcher desatualizadas | CI do Windows falha | regerar no Windows (§3.5) em toda PR que muda uma página |
