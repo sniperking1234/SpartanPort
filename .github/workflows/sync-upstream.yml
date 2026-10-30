@@ -1,0 +1,154 @@
+name: Sync upstream branches
+
+on:
+  schedule:
+    - cron: "30 18 * * *"   # 每天 UTC 18:30（北京时间次日凌晨 2:30）运行
+  workflow_dispatch: {}      # 也支持在 Actions 页面手动触发
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+# 内置 GITHUB_TOKEN 需要 Contents 写权限：下方"两步镜像"的第一步
+# 用它推送分支/tag（它创建的推送永远不会触发任何 workflow）。
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    # 防止这个文件哪天被合并进上游后、在上游仓库里误跑
+    if: github.repository_owner != 'FelipePrado0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # 关键：用带 Workflows 写权限的 PAT 检出并推送。
+      # Actions 内置的 GITHUB_TOKEN 是 GitHub App token，GitHub 安全策略禁止它
+      # 推送任何会创建/修改 .github/workflows/ 的提交——而下方"放回"步骤每次
+      # 都会产生这样的提交，所以必须用 secret SYNC_TOKEN。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # 必须拉全量历史，否则推送不了
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      # 注意：本仓库不是 fork，而是独立镜像仓库（SpartanPort 是
+      # Supermedo/bloodborne_pc 的 fork，而该 fork 网络已被
+      # sniperking1234/bloodborne_pc 占用——GitHub 限制同一 fork 网络
+      # 每个账号一个 fork，所以只能用 gh repo create 建 standalone 仓库。
+      # 镜像机制完全不依赖 fork 关系，效果等同）。
+      # main（默认分支）会被镜像成上游版本，这个文件自己会"消失"，所以先备份
+      - name: Back up this workflow file
+        run: cp .github/workflows/sync-upstream.yml "$RUNNER_TEMP/sync.yml"
+
+      - name: Fetch upstream
+        run: |
+          git remote -v | grep -q upstream || \
+            git remote add upstream https://github.com/FelipePrado0/SpartanPort.git
+          # 分支和 tag 一次取齐：之后的任何 push 前都不再 fetch——任何 fetch
+          #（含 --tags fetch）都会创建 refs/remotes/upstream/HEAD 符号引用，
+          # 它会被 refspec 通配符匹配到、生成一个叫 HEAD 的垃圾分支；负向
+          # refspec 挡不住它，所以取完一次性删掉这个 symref 再开始推送
+          git fetch --prune --tags upstream
+          git remote set-head upstream --delete
+
+      # 两步镜像，杀死上游的 on: push CI（rust-launcher.yml 的触发器只有 path 过滤、
+      # 没有分支过滤：launcher-rust/** 或它自己被改动就触发）：
+      #   1) 先用内置 GITHUB_TOKEN 推：App token 产生的推送事件永不触发任何
+      #      workflow（官方防递归行为）
+      #   2) GITHUB_TOKEN 无 Workflows 权限，包含 .github/workflows 改动的 ref
+      #      会被拒绝（防提权）——届时已成功推上去的 ref 变为"up to date"，
+      #      第 2 步 PAT 重推只补剩下的 ref，因此只有上游改 workflow 文件的
+      #      罕见提交才可能触发 CI（main 上的 workflow 条目已禁用可拦住）。
+      # 已试废方案：把 rust-launcher.yml"随身携带"在 main 上维持其禁用条目——
+      # 文件离开 main 时条目被删，重建时回到 active（不记得禁用状态），
+      # 携带它的 keep-workflow 推送会自己触发它，等于每晚自触发。
+      - name: Mirror all upstream branches (built-in token, no CI triggered)
+        env:
+          APP_TOKEN: ${{ github.token }}
+        run: |
+          git push --force "https://x-access-token:${APP_TOKEN}@github.com/$GITHUB_REPOSITORY.git" \
+            'refs/remotes/upstream/*:refs/heads/*' || echo "(部分 ref 需 PAT 补推)"
+
+      - name: Mirror all upstream tags (built-in token, no CI triggered)
+        env:
+          APP_TOKEN: ${{ github.token }}
+        run: |
+          # tag 已在 Fetch upstream 步骤取齐，这里只推不取
+          git push --force "https://x-access-token:${APP_TOKEN}@github.com/$GITHUB_REPOSITORY.git" \
+            --tags || echo "(部分 tag 需 PAT 补推)"
+
+      # 第 2 步：PAT 补推内置 token 被拒的 ref（已推成功的是 up to date，自动跳过）。
+      # 同步所有 tag（windows-v1.0 ~ windows-v2.7.0 等 46 个）；只加不删——
+      # 上游删掉的 tag 会留在本仓库（tag 很少被删，一般无影响）
+      - name: Finish branch/tag mirror with PAT
+        run: |
+          git push --force origin 'refs/remotes/upstream/*:refs/heads/*'
+          git push --force origin --tags
+
+      # 镜像上游 release（说明文字 + 二进制附件，Windows/Linux/macOS 包，
+      # 28 个 release 共 ~3.2 GB）。只做增量：已存在的 release 不重建，
+      # 仅补缺失资产、同步更新的正文。首次运行要搬运全部附件（~20 分钟级），
+      # 之后每次基本秒过。
+      # 双 token：读上游用内置 GITHUB_TOKEN（公开仓库只读没问题，但无写权限），
+      # 写本仓库用 SYNC_TOKEN（细粒度 PAT，Contents 写权限）。
+      - name: Mirror upstream releases into this repo
+        env:
+          UP_TOKEN: ${{ github.token }}          # 只读上游（公开仓库）
+          FORK_TOKEN: ${{ secrets.SYNC_TOKEN }}   # 写入本仓库
+        run: |
+          UPSTREAM=FelipePrado0/SpartanPort
+          FORK="$GITHUB_REPOSITORY"
+          DIR="$RUNNER_TEMP/relmirror"
+          mkdir -p "$DIR"
+
+          up()   { GH_TOKEN="$UP_TOKEN"   gh "$@" --repo "$UPSTREAM"; }
+          mine() { GH_TOKEN="$FORK_TOKEN" gh "$@" --repo "$FORK"; }
+
+          # 上游 release 的 tag，从旧到新（本仓库 Latest 徽章落在最新版）
+          mapfile -t tags < <(up release list --limit 100 --json tagName --jq '.[].tagName' | tac)
+
+          for tag in "${tags[@]}"; do
+            echo "== release $tag"
+            fork_json=$(mine release view "$tag" --json body,assets 2>/dev/null || true)
+            if [[ -z "$fork_json" ]]; then
+              name=$(up release view "$tag" --json name --jq .name)
+              is_pre=$(up release view "$tag" --json isPrerelease --jq .isPrerelease)
+              up release view "$tag" --json body --jq .body > "$DIR/body.md"
+              args=(--title "$name" --notes-file "$DIR/body.md" --verify-tag)
+              [[ "$is_pre" == "true" ]] && args+=(--prerelease)
+              mine release create "$tag" "${args[@]}"
+              fork_json=$(mine release view "$tag" --json body,assets)
+            else
+              # 正文与上游不同则更新
+              up release view "$tag" --json body --jq .body > "$DIR/body.md"
+              if [[ "$(jq -r .body <<<"$fork_json")" != "$(cat "$DIR/body.md")" ]]; then
+                mine release edit "$tag" --notes-file "$DIR/body.md" >/dev/null
+              fi
+            fi
+
+            # 补缺失的资产
+            mapfile -t have < <(jq -r '.assets[].name' <<<"$fork_json")
+            for a in $(up release view "$tag" --json assets --jq '.assets[].name'); do
+              if printf '%s\n' "${have[@]}" | grep -qx "$a"; then continue; fi
+              echo "  asset $tag/$a：下载并上传"
+              up release download "$tag" --pattern "$a" --dir "$DIR" --clobber
+              mine release upload "$tag" "$DIR/$a" --clobber
+              rm -f "$DIR/$a"
+            done
+          done
+
+      # 镜像必然覆盖默认分支 main——把 workflow 文件放回并提交推送
+      #（否则 main 被镜像后文件消失，定时任务会"自杀"）
+      # mkdir -p 兜底上游分支不存在 .github/workflows 目录的情况。
+      # 只放回本文件——不要把上游分支的 workflow 文件"携带"到 main 来维持其
+      # 禁用条目：条目随文件离开 main 被删、重建时回到 active，携带反而会
+      # 每晚触发（见上方"两步镜像"注释）。
+      - name: Put this workflow back on main
+        run: |
+          git checkout -f -B main upstream/main
+          mkdir -p .github/workflows
+          cp "$RUNNER_TEMP/sync.yml" .github/workflows/sync-upstream.yml
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/sync-upstream.yml
+          git commit -m "chore: keep fork-sync workflow"
+          git push origin main
